@@ -1,0 +1,334 @@
+# Android release: the website's Android link (/download/android ->
+# https://github.com/arbazpirwani/playwani-releases/releases/latest/download/SilkChess.apk) always serves the version
+# that is live, however it went live (a release by script or a deploy by hand). Every 30 minutes a cheap check compares
+# both hosts' /api/health with this repo's releases; only when the live version has no public release yet does a build
+# run: the private repo's own scripts build the release-signed APK (scripts/android-release.mjs) and publish it here
+# with every check (scripts/public-release.mjs). README.md, "Android release workflow", says how to set it up.
+#
+# THIS REPO IS PUBLIC: its logs are public and a fork's pull request must never reach a secret. So: no pull_request,
+# pull_request_target or push trigger; no artifacts (the APK leaves only through the release, the R8 mapping never);
+# no environment dumps and no `set -x`; every third-party action pinned to a commit SHA.
+name: Android release
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, like v0.101.34 (empty: the version both hosts serve now)'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Dry run: build, sign and verify the APK, publish nothing'
+        required: false
+        default: false
+        type: boolean
+  # a script can ask for a run: gh api repos/arbazpirwani/playwani-releases/dispatches -f event_type=release
+  repository_dispatch:
+    types: [release]
+
+permissions:
+  contents: read
+
+# one run at a time, never cancelled half-way (a release half-published is worse than a late one)
+concurrency:
+  group: android-release
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: arbazpirwani/silk-road-chess
+  # the same two hosts public-release.mjs waits for (both must serve the version before it publishes)
+  HEALTH_URLS: https://silkroad.playwani.com/api/health,https://silk-road-chess.onrender.com/api/health
+
+jobs:
+  check:
+    name: Is the live version public yet?
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      version: ${{ steps.decide.outputs.version }}
+      dry_run: ${{ steps.decide.outputs.dry_run }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WANT: ${{ inputs.version }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          skip() { echo "::notice::$1"; echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Skipped: $1" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          semver='^v[0-9]+\.[0-9]+(\.[0-9]+)?$'
+
+          # 1. the live version: both hosts must answer, and agree (else a deploy is in progress: try at the next run)
+          live=""
+          IFS=, read -r -a hosts <<< "$HEALTH_URLS"
+          for url in "${hosts[@]}"; do
+            v="$(curl -fsS --max-time 90 --retry 2 --retry-delay 15 "$url" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)"
+            echo "$url: ${v:-no answer}"
+            [[ "$v" =~ $semver ]] || skip "$url gave no version (asleep, down or deploying); the next run tries again"
+            if [ -z "$live" ]; then live="$v"; elif [ "$v" != "$live" ]; then skip "the hosts disagree ($live, $v): a deploy is in progress; the next run tries again"; fi
+          done
+
+          # 2. the version to build: the dispatch's input, else the live one. Only the live version can be published
+          #    (public-release.mjs waits for both hosts to serve it), so another version is a dry run only.
+          want="${WANT#v}"; want="${want:+v$want}"
+          if [ -n "$want" ]; then
+            [[ "$want" =~ $semver ]] || { echo "::error::the version input is not like v0.101.34"; exit 1; }
+            if [ "$want" != "$live" ] && [ "$DRY_RUN" != "true" ]; then
+              echo "::error::$want is not live (both hosts serve $live): only the live version is published. Run it with dry_run to build another version."
+              exit 1
+            fi
+          fi
+          target="${want:-$live}"
+
+          # 3. this repo's releases: never overwrite one (a dry run publishes nothing, so it may build any version)
+          latest="$(gh release view --repo "$REPO" --json tagName --jq .tagName 2>/dev/null || echo none)"
+          echo "live $live; latest public release $latest; to build: $target; dry run: $DRY_RUN"
+          if out="$(gh api "repos/$REPO/releases/tags/$target" --jq .tag_name 2>&1)"; then
+            exists=true
+          elif grep -q 'HTTP 404' <<< "$out"; then
+            exists=false
+          else
+            echo "::error::could not read the releases of $REPO"; exit 1
+          fi
+          if [ "$exists" = true ] && [ "$DRY_RUN" != "true" ]; then skip "$target is public already (latest: $latest): nothing to do"; fi
+
+          { echo "skip=false"; echo "version=$target"; echo "dry_run=$DRY_RUN"; } >> "$GITHUB_OUTPUT"
+          echo "Building $target (live $live, latest public release $latest, dry run $DRY_RUN)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build, sign, verify, publish
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # only the publish step uses it: gh release create on this repo (github.token)
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      DRY_RUN: ${{ needs.check.outputs.dry_run }}
+    steps:
+      - name: The three secrets are set (README.md)
+        env:
+          HAS_P12: ${{ secrets.KEYSTORE_P12_BASE64 != '' }}
+          HAS_PASS: ${{ secrets.KEYSTORE_PASSWORD != '' }}
+          HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
+        run: |
+          missing=""
+          [ "$HAS_P12" = true ] || missing="$missing KEYSTORE_P12_BASE64"
+          [ "$HAS_PASS" = true ] || missing="$missing KEYSTORE_PASSWORD"
+          [ "$HAS_TOKEN" = true ] || missing="$missing PRIVATE_REPO_TOKEN"
+          if [ -n "$missing" ]; then echo "::error::secret(s) not set:$missing (README.md, Android release workflow)"; exit 1; fi
+
+      # The source: the tag v<BUILD> (every scripted release makes one), else main (a deploy by hand may have no tag),
+      # whose BUILD is checked against the live version in the next step but one.
+      - name: The source of ${{ env.VERSION }}
+        id: ref
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$PRIVATE_REPO" --jq .full_name > /dev/null 2>&1 \
+            || { echo "::error::PRIVATE_REPO_TOKEN cannot read $PRIVATE_REPO (expired, or without Contents: read on it)"; exit 1; }
+          if out="$(gh api "repos/$PRIVATE_REPO/git/ref/tags/$VERSION" --jq .object.sha 2>&1)"; then
+            echo "ref=refs/tags/$VERSION" >> "$GITHUB_OUTPUT"; echo "source: the tag $VERSION"
+          elif grep -q 'HTTP 404' <<< "$out"; then
+            echo "ref=main" >> "$GITHUB_OUTPUT"; echo "source: main (no tag $VERSION, a deploy by hand); its BUILD is checked next"
+          else
+            echo "::error::could not read the tags of $PRIVATE_REPO"; exit 1
+          fi
+
+      - name: Check out the private repo (read-only token, not kept in .git/config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ steps.ref.outputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      # BUILD lives in packages/protocol/src/index.ts (apps/web/src/version.ts re-exports it; build.gradle and both
+      # scripts read it there)
+      - name: The checkout is BUILD ${{ env.VERSION }}
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          set -euo pipefail
+          build="$(sed -nE "s/^export const BUILD = '(v[0-9.]+)';.*/\1/p" src/packages/protocol/src/index.ts)"
+          if [ "$build" != "$VERSION" ]; then
+            if [ "$REF" = main ]; then
+              echo "::error::the hosts serve $VERSION, there is no tag $VERSION, and main's BUILD is ${build:-unreadable}. Tag the deployed commit (git tag $VERSION <commit> && git push origin $VERSION) and run this workflow again."
+            else
+              echo "::error::the tag $VERSION carries BUILD ${build:-unreadable}, not $VERSION"
+            fi
+            exit 1
+          fi
+          echo "BUILD $build at $(git -C src rev-parse --short=12 HEAD) ($REF)"
+          echo "COMMIT=$(git -C src rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'   # Capacitor 8's source level; passed on as SILK_JAVA_HOME
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: src/package.json   # its packageManager field names the pnpm version
+
+      # The runner's preinstalled SDK (ANDROID_HOME). android-release.mjs and public-release.mjs both take the newest
+      # numeric build-tools folder; public-release.mjs is also handed the two tools by path.
+      - name: Android build-tools (apksigner, aapt)
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [ -n "$sdk" ] && [ -d "$sdk/build-tools" ] || { echo "::error::no Android SDK on this runner (ANDROID_HOME)"; exit 1; }
+          bt="$(for d in "$sdk"/build-tools/*/; do d="${d%/}"; d="${d##*/}"; [[ "$d" =~ ^[0-9]+(\.[0-9]+)*$ ]] && echo "$d"; done | sort -V | tail -n 1)"
+          [ -n "$bt" ] || { echo "::error::no numbered build-tools folder in $sdk/build-tools"; exit 1; }
+          for t in apksigner aapt; do
+            [ -x "$sdk/build-tools/$bt/$t" ] || { echo "::error::build-tools $bt has no $t"; exit 1; }
+          done
+          { echo "ANDROID_HOME=$sdk"; echo "APKSIGNER_BIN=$sdk/build-tools/$bt/apksigner"; echo "AAPT_BIN=$sdk/build-tools/$bt/aapt"; } >> "$GITHUB_ENV"
+          echo "Android SDK $sdk, build-tools $bt"
+
+      - name: Install (frozen lockfile)
+        working-directory: src
+        run: pnpm install --frozen-lockfile
+
+      # android-release.mjs builds the protocol, whose tsc needs the engine's dist: on the Mac it is always there, on a
+      # fresh checkout it is not
+      - name: Build the engine
+        working-directory: src
+        run: pnpm --filter @silk/engine build
+
+      # The player notes: docs/release-notes/<version>.md (at the checkout, else on main) when it passes the notes rule
+      # (android-apk.mjs notesProblems, the rule public-release.mjs applies), else a generic note, so the APK still goes
+      # out; a refused file is named in a warning.
+      - name: Player notes
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes-$VERSION.md"
+          rel="docs/release-notes/$VERSION.md"
+          lint() {
+            node --input-type=module -e '
+              import { readFileSync } from "node:fs";
+              import { pathToFileURL } from "node:url";
+              const { notesProblems } = await import(pathToFileURL(process.argv[1]).href);
+              for (const p of notesProblems(readFileSync(process.argv[2], "utf8"))) console.log(p);
+            ' "$GITHUB_WORKSPACE/src/scripts/android-apk.mjs" "$1"
+          }
+          from=""
+          if [ -f "src/$rel" ]; then
+            cp "src/$rel" "$notes"; from="$rel at the checkout"
+          elif gh api -H 'Accept: application/vnd.github.raw' "repos/$PRIVATE_REPO/contents/$rel?ref=main" > "$notes" 2> /dev/null; then
+            from="$rel on main"
+          fi
+          if [ -n "$from" ]; then
+            problems="$(lint "$notes")"
+            if [ -n "$problems" ]; then
+              echo "::warning::$from fails the notes rule, so the generic note goes out instead: $(echo "$problems" | tr '\n' ';')"
+              from=""
+            fi
+          fi
+          if [ -z "$from" ]; then
+            cat > "$notes" <<'NOTES'
+          **What's new**
+          - Improvements and fixes from the latest update.
+
+          **Install**
+          - If a test build of Silk Road Chess is on your phone, uninstall it first.
+          - Download SilkChess.apk below on your Android phone, open it, and allow the install when Android asks.
+
+          Play in your browser any time: https://silkroad.playwani.com
+          NOTES
+            from="the generic note"
+            problems="$(lint "$notes")"
+            [ -z "$problems" ] || { echo "::error::the generic note fails the notes rule: $(echo "$problems" | tr '\n' ';')"; exit 1; }
+          fi
+          echo "notes: $from"
+          echo "NOTES=$notes" >> "$GITHUB_ENV"
+
+      # The key in a private temp folder, in the two files android-release.mjs reads (it trims the password file).
+      # Opened once with keytool so a wrong password fails here, not after the build.
+      - name: The release key (a private temp folder)
+        env:
+          P12_BASE64: ${{ secrets.KEYSTORE_P12_BASE64 }}
+          STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/silk-key"
+          rm -rf "$dir"; mkdir -m 700 "$dir"
+          printf '%s' "$P12_BASE64" | base64 -d > "$dir/silk-release.p12"
+          printf '%s' "$STORE_PASS" > "$dir/release-keystore-pass"
+          [ -s "$dir/silk-release.p12" ] || { echo "::error::KEYSTORE_P12_BASE64 decodes to nothing"; exit 1; }
+          KS_PASS="$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8").trim())' "$dir/release-keystore-pass")"
+          export KS_PASS
+          keytool -list -storetype PKCS12 -keystore "$dir/silk-release.p12" -storepass:env KS_PASS -alias silk > /dev/null \
+            || { echo "::error::the keystore does not open with KEYSTORE_PASSWORD, or has no key 'silk'"; exit 1; }
+          echo "SILK_KEY_DIR=$dir" >> "$GITHUB_ENV"
+          echo "the release key is in place"
+
+      # android-release.mjs: web (VITE_SERVER_URL = the players' site, SILK_COMMIT = HEAD), cap sync, gradle
+      # assembleRelease signed from the key files, then its checks (release key only, not debuggable, BUILD, commit and
+      # server in the bundle, App Links hosts, clean tree). Its macOS defaults are all overridden here: SILK_KEY_DIR
+      # (~/.config/playwani), OUT_DIR (~/Downloads), SILK_JAVA_HOME (/usr/libexec/java_home), ANDROID_HOME
+      # (~/Library/Android/sdk). The R8 mapping it copies into SILK_KEY_DIR is deleted with the key below.
+      - name: Build the release-signed APK (scripts/android-release.mjs)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          OUT_DIR="$out" SILK_JAVA_HOME="$JAVA_HOME" KEY_ALIAS=silk node scripts/android-release.mjs
+          apk="$out/SilkChess-$VERSION-signed.apk"
+          [ -f "$apk" ] || { echo "::error::android-release.mjs wrote no $apk"; exit 1; }
+          echo "APK=$apk" >> "$GITHUB_ENV"
+          echo "SHA256=$(sha256sum "$apk" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: On a failure, the last lines of each build log
+        if: failure()
+        run: |
+          for f in "$RUNNER_TEMP"/out/.silk-release-logs/*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$(basename "$f")"; tail -n 60 "$f"; echo "::endgroup::"
+          done
+
+      # public-release.mjs checks the APK again (release key, not debuggable, BUILD) and the notes, refuses an existing
+      # tag, waits for both hosts to serve BUILD, creates the release as latest with SilkChess-<tag>.apk and
+      # SilkChess.apk, and reads back the digests, releases/latest and the stable link's redirect.
+      - name: Publish here (scripts/public-release.mjs)
+        if: env.DRY_RUN != 'true'
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # published meanwhile by another publisher (push-release.mjs, or by hand): never overwrite, and not a failure
+          if gh api "repos/$PUBLIC_REPO/releases/tags/$VERSION" --jq .tag_name > /dev/null 2>&1; then
+            echo "::notice::$VERSION was published meanwhile by another publisher: nothing to do"
+            echo "$VERSION was published meanwhile by another publisher; this run's APK (sha256 $SHA256) was not used" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node scripts/public-release.mjs "$APK" "$NOTES"
+          echo "Published $VERSION (commit ${COMMIT:0:12}, sha256 $SHA256)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run, nothing published
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "::notice::dry run: $VERSION built, signed and verified (sha256 $SHA256); nothing was published"
+          echo "Dry run: $VERSION built, signed and verified at ${COMMIT:0:12} (sha256 $SHA256); nothing was published" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the key, the mapping and the build output
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/silk-key" "$RUNNER_TEMP/out" "$RUNNER_TEMP"/notes-*.md "$GITHUB_WORKSPACE/src/apps/web/android/app/build"
