@@ -1,8 +1,9 @@
 # Android release: the website's Android link (/download/android ->
 # https://github.com/arbazpirwani/playwani-releases/releases/latest/download/SilkChess.apk) always serves the version
-# that is live, however it went live (a release by script or a deploy by hand). Every 30 minutes a cheap check compares
-# both hosts' /api/health with this repo's releases; only when the live version has no public release yet does a build
-# run: the private repo's own scripts build the release-signed APK (scripts/android-release.mjs) and publish it here
+# that is live, however it went live (a release by script or a deploy by hand). Every 30 minutes a cheap check reads the
+# private repo's BUILD on main and its newest v* tag through the API; when both are released here it stops without
+# touching the hosts (Render's free instance is never woken by it). Otherwise it compares both hosts' /api/health with
+# this repo's releases; only when the live version has no public release yet does a build run: the private repo's own scripts build the release-signed APK (scripts/android-release.mjs) and publish it here
 # with every check (scripts/public-release.mjs). README.md, "Android release workflow", says how to set it up.
 #
 # THIS REPO IS PUBLIC: its logs are public and a fork's pull request must never reach a secret. So: no pull_request,
@@ -56,6 +57,7 @@ jobs:
         id: decide
         env:
           GH_TOKEN: ${{ github.token }}
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
           REPO: ${{ github.repository }}
           WANT: ${{ inputs.version }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
@@ -63,6 +65,44 @@ jobs:
           set -euo pipefail
           skip() { echo "::notice::$1"; echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Skipped: $1" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
           semver='^v[0-9]+\.[0-9]+(\.[0-9]+)?$'
+          # a release of $1 here: 0 yes, 1 no, 2 unreadable
+          public() {
+            local out
+            if out="$(gh api "repos/$REPO/releases/tags/$1" --jq .tag_name 2>&1)"; then return 0; fi
+            if grep -q 'HTTP 404' <<< "$out"; then return 1; fi
+            return 2
+          }
+          # main's BUILD and the private repo's newest v* tag, through the API (the token never printed)
+          private_versions() {
+            local src tags
+            src="$(GH_TOKEN="$PRIVATE_TOKEN" gh api -H 'Accept: application/vnd.github.raw' "repos/$PRIVATE_REPO/contents/packages/protocol/src/index.ts?ref=main" 2> /dev/null)" || return 1
+            main_build="$(sed -nE "s/^export const BUILD = '(v[0-9.]+)';.*/\1/p" <<< "$src")"
+            [[ "$main_build" =~ $semver ]] || return 1
+            tags="$(GH_TOKEN="$PRIVATE_TOKEN" gh api --paginate "repos/$PRIVATE_REPO/git/matching-refs/tags/v" --jq '.[].ref' 2> /dev/null)" || return 1
+            tags="${tags//refs\/tags\//}"
+            newest_tag="$(grep -E "$semver" <<< "$tags" | sort -V | tail -n 1 || true)"
+          }
+
+          # 0. Without waking the hosts (Render's free instance sleeps when idle: a health call every 30 minutes would
+          #    wake it 48 times a day). The live version comes from main, so when main's BUILD and the newest tag are
+          #    both public here already, nothing can be new: stop before any health call. A dispatch with a version or
+          #    a dry run goes straight to the hosts.
+          if [ -z "$WANT" ] && [ "$DRY_RUN" != "true" ]; then
+            main_build="" newest_tag=""
+            if [ -z "$PRIVATE_TOKEN" ]; then
+              echo "::notice::PRIVATE_REPO_TOKEN is not set, so every run asks the hosts (README.md)"
+            elif private_versions; then
+              all=true
+              for v in "$main_build" ${newest_tag:+"$newest_tag"}; do
+                rc=0; public "$v" || rc=$?
+                [ "$rc" = 0 ] || all=false
+              done
+              echo "private repo: main's BUILD $main_build, newest tag ${newest_tag:-none}; both public here: $all"
+              [ "$all" = false ] || skip "main's BUILD $main_build and the newest tag ${newest_tag:-none} are public already (the hosts were not asked)"
+            else
+              echo "::warning::PRIVATE_REPO_TOKEN could not read the BUILD on main or the tags of $PRIVATE_REPO, so the hosts are asked"
+            fi
+          fi
 
           # 1. the live version: both hosts must answer, and agree (else a deploy is in progress: try at the next run)
           live=""
@@ -89,13 +129,9 @@ jobs:
           # 3. this repo's releases: never overwrite one (a dry run publishes nothing, so it may build any version)
           latest="$(gh release view --repo "$REPO" --json tagName --jq .tagName 2>/dev/null || echo none)"
           echo "live $live; latest public release $latest; to build: $target; dry run: $DRY_RUN"
-          if out="$(gh api "repos/$REPO/releases/tags/$target" --jq .tag_name 2>&1)"; then
-            exists=true
-          elif grep -q 'HTTP 404' <<< "$out"; then
-            exists=false
-          else
-            echo "::error::could not read the releases of $REPO"; exit 1
-          fi
+          rc=0; public "$target" || rc=$?
+          [ "$rc" != 2 ] || { echo "::error::could not read the releases of $REPO"; exit 1; }
+          exists=false; [ "$rc" != 0 ] || exists=true
           if [ "$exists" = true ] && [ "$DRY_RUN" != "true" ]; then skip "$target is public already (latest: $latest): nothing to do"; fi
 
           { echo "skip=false"; echo "version=$target"; echo "dry_run=$DRY_RUN"; } >> "$GITHUB_OUTPUT"

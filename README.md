@@ -10,10 +10,13 @@ newest release here.
 `.github/workflows/android-release.yml` keeps that link on the version that is live, however it went live (a release by
 script or a deploy by hand):
 
-1. **Check, every 30 minutes** (about 10 seconds of runner time): it reads `version` from both hosts' `/api/health`
-   (`silkroad.playwani.com` and `silk-road-chess.onrender.com`). If a host gives no answer or the two disagree (a deploy
-   in progress), it stops and tries again at the next run. If this repo already has a release for that version, it stops:
-   a release is never overwritten.
+1. **Check, every 30 minutes** (about 10 seconds of runner time). First it reads, through the GitHub API, the BUILD on
+   the private repo's `main` and its newest `v*` tag. When both already have a release here, it stops without contacting
+   the hosts, so Render's free instance is not woken every 30 minutes. Only when one of them has no release yet does it
+   read `version` from both hosts' `/api/health` (`silkroad.playwani.com` and `silk-road-chess.onrender.com`). If a host
+   gives no answer or the two disagree (a deploy in progress), it stops and tries again at the next run. If this repo
+   already has a release for the live version, it stops: a release is never overwritten. Without `PRIVATE_REPO_TOKEN`,
+   every run asks the hosts.
 2. **Build**, only when the live version has no release here yet. It checks out the private repo `silk-road-chess` at the
    tag `v<BUILD>` (every scripted release makes one), or else at `main`, whose BUILD must then equal the live version.
    It runs the private repo's own `scripts/android-release.mjs` (the release-signed APK, with all its checks) on Java 21,
@@ -35,7 +38,7 @@ Mac: the mapping is written to `~/.config/playwani/mapping/`.
 | --- | --- |
 | `KEYSTORE_P12_BASE64` | the release key `silk-release.p12`, base64 |
 | `KEYSTORE_PASSWORD` | the key's password (the `release-keystore-pass` file) |
-| `PRIVATE_REPO_TOKEN` | a fine-grained token that can only read `silk-road-chess` |
+| `PRIVATE_REPO_TOKEN` | a fine-grained token that can only read `silk-road-chess` (used by the check and the build) |
 
 Set them from your own terminal. The values go straight from the files to GitHub and are never pasted anywhere else:
 
