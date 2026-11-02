@@ -219,15 +219,33 @@ jobs:
         with:
           package_json_file: src/package.json   # its packageManager field names the pnpm version
 
-      # The runner's preinstalled SDK (ANDROID_HOME). android-release.mjs and public-release.mjs both take the newest
-      # numeric build-tools folder; public-release.mjs is also handed the two tools by path.
-      - name: Android build-tools (apksigner, aapt)
+      # build-tools 36.0.0, the Mac's. WHY: scripts/android-apk.mjs parses apksigner's "Signer #1 certificate SHA-256
+      # digest:" lines, and apksigner 37 prints "V2 Signer: certificate SHA-256 digest:" instead, so the runner's 37.0.0
+      # refused the release-signed APK ("1 signers, not one", "signed with no key", run 41457376255).
+      # android-release.mjs picks the NEWEST numbered build-tools folder under ANDROID_HOME itself (APKSIGNER_BIN does
+      # not reach it), so every newer folder is moved aside on this throwaway runner; Gradle (AGP 8.13) builds with 35.0.0.
+      # Drop this once android-apk.mjs reads both formats.
+      - name: Android build-tools 36.0.0 (apksigner, aapt)
+        env:
+          WANT_BT: 36.0.0
         run: |
           set -euo pipefail
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           [ -n "$sdk" ] && [ -d "$sdk/build-tools" ] || { echo "::error::no Android SDK on this runner (ANDROID_HOME)"; exit 1; }
-          bt="$(for d in "$sdk"/build-tools/*/; do d="${d%/}"; d="${d##*/}"; [[ "$d" =~ ^[0-9]+(\.[0-9]+)*$ ]] && echo "$d"; done | sort -V | tail -n 1)"
-          [ -n "$bt" ] || { echo "::error::no numbered build-tools folder in $sdk/build-tools"; exit 1; }
+          numbered() { for d in "$sdk"/build-tools/*/; do d="${d%/}"; d="${d##*/}"; if [[ "$d" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then echo "$d"; fi; done; }
+          if [ ! -x "$sdk/build-tools/$WANT_BT/apksigner" ]; then
+            { yes || true; } | "$sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk" "build-tools;$WANT_BT" > /dev/null
+            echo "installed build-tools $WANT_BT"
+          fi
+          hidden="$RUNNER_TEMP/hidden-build-tools"
+          mkdir -p "$hidden"
+          for v in $(numbered); do
+            [ "$(printf '%s\n%s\n' "$v" "$WANT_BT" | sort -V | tail -n 1)" != "$WANT_BT" ] || continue   # not newer
+            mv "$sdk/build-tools/$v" "$hidden/" 2> /dev/null || sudo mv "$sdk/build-tools/$v" "$hidden/"
+            echo "moved aside: build-tools $v"
+          done
+          bt="$(numbered | sort -V | tail -n 1)"
+          [ "$bt" = "$WANT_BT" ] || { echo "::error::the newest build-tools is ${bt:-none}, not $WANT_BT"; exit 1; }
           for t in apksigner aapt; do
             [ -x "$sdk/build-tools/$bt/$t" ] || { echo "::error::build-tools $bt has no $t"; exit 1; }
           done
