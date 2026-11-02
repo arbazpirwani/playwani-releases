@@ -13,7 +13,9 @@ name: Android release
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    # :17 and :47, not :00/:30: GitHub documents delays and dropped runs at the top and half of the hour, and this
+    # workflow's first 14 half-hour slots never ran (2026-11-02). A changed cron line also reactivates a deactivated schedule.
+    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       version:

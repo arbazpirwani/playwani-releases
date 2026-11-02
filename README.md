@@ -10,9 +10,9 @@ newest release here.
 `.github/workflows/android-release.yml` keeps that link on the version that is live, however it went live (a release by
 script or a deploy by hand):
 
-1. **Check, every 30 minutes** (about 10 seconds of runner time). First it reads, through the GitHub API, the BUILD on
+1. **Check, every 30 minutes (at :17 and :47)** (about 10 seconds of runner time). First it reads, through the GitHub API, the BUILD on
    the private repo's `main` and its newest `v*` tag. When both already have a release here, it stops without contacting
-   the hosts, so Render's free instance is not woken every 30 minutes. Only when one of them has no release yet does it
+   the hosts, so Render's free instance is not woken every 30 minutes (at :17 and :47). Only when one of them has no release yet does it
    read `version` from both hosts' `/api/health` (`silkroad.playwani.com` and `silk-road-chess.onrender.com`). If a host
    gives no answer or the two disagree (a deploy in progress), it stops and tries again at the next run. If this repo
    already has a release for the live version, it stops: a release is never overwritten. Without `PRIVATE_REPO_TOKEN`,
@@ -73,7 +73,7 @@ A script can ask for a run with `gh api repos/arbazpirwani/playwani-releases/dis
 
 - **One publisher wins.** If `push-release.mjs` or a run of `public-release.mjs` by hand publishes the version first,
   this workflow sees the release before its own publish step and ends green without publishing.
-- **A failing build tries again every 30 minutes** until the cause is fixed or a newer version goes live. Each try sends
+- **A failing build tries again every 30 minutes (at :17 and :47)** until the cause is fixed or a newer version goes live. Each try sends
   a failure email. To pause it, open Actions, Android release, the "..." menu, Disable workflow.
 - **GitHub disables scheduled workflows in a public repo after 60 days with no activity** and emails a warning first. To
   turn it back on, open Actions, Android release, Enable workflow.
